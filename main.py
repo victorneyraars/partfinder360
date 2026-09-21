@@ -529,3 +529,70 @@ def save_scraped_vehicle(payload: VehicleIngestPayload):
         return {"status": "SUCCESS", "message": f"Vehículo {patente_clean} guardado en caché permanente."}
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error guardando en caché: {str(e)}")
+
+
+@app.post("/api/patente/fallback-boostr")
+def fallback_boostr(payload: dict):
+    plate = payload.get("patente") or payload.get("plate")
+    if not plate:
+        raise HTTPException(status_code=400, detail="Falta el campo patente")
+    plate_clean = str(plate).strip().upper().replace("-", "").replace(" ", "")
+    
+    # 1. Revisar si ya está en caché
+    try:
+        conn = get_db_connection()
+        cur = conn.cursor()
+        cur.execute("SELECT data, created_at FROM vehicle_cache WHERE plate = %s;", (plate_clean,))
+        row = cur.fetchone()
+        cur.close()
+        conn.close()
+        if row and row.get("data"):
+            d = row["data"].get("data") if isinstance(row["data"], dict) and "data" in row["data"] else row["data"]
+            return {"source": "CACHE_LOCAL", "data": d}
+    except Exception as e:
+        print(f"Error en cache fallback: {e}")
+
+    # 2. Consumir Boostr API
+    if not BOOSTR_API_KEY:
+        raise HTTPException(status_code=500, detail="BOOSTR_API_KEY no configurada")
+    
+    url = f"https://api.boostr.cl/vehicle/{plate_clean}.json"
+    headers = {"X-API-KEY": BOOSTR_API_KEY}
+    try:
+        r = requests.get(url, headers=headers, timeout=15)
+        if r.status_code != 200:
+            raise HTTPException(status_code=404, detail="Patente no encontrada en Boostr")
+        b_res = r.json()
+        v_inner = b_res.get("data", {})
+        if not v_inner or not v_inner.get("make"):
+            raise HTTPException(status_code=404, detail="Datos no encontrados en Boostr")
+        
+        final_data = v_inner.copy()
+        final_data["patente"] = final_data.get("plate", plate_clean)
+        final_data["marca"] = final_data.get("marca") or final_data.get("make")
+        final_data["modelo"] = final_data.get("modelo") or final_data.get("model")
+        final_data["anio"] = final_data.get("anio") or final_data.get("year")
+        chassis_val = final_data.get("chassis") or final_data.get("chasis") or final_data.get("vin")
+        if chassis_val:
+            final_data["chasis"] = chassis_val
+            final_data["vin"] = chassis_val
+        final_data["data_source"] = "BOOSTR_FALLBACK"
+
+        enrich_with_sii(final_data)
+
+        # Guardar en vehicle_cache
+        conn = get_db_connection()
+        cur = conn.cursor()
+        cur.execute("""
+            INSERT INTO vehicle_cache (plate, data, created_at) VALUES (%s, %s::jsonb, NOW())
+            ON CONFLICT (plate) DO UPDATE SET data = EXCLUDED.data, created_at = NOW();
+        """, (plate_clean, json.dumps(final_data)))
+        conn.commit()
+        cur.close()
+        conn.close()
+
+        return {"source": "BOOSTR_FALLBACK", "data": final_data}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
