@@ -1,0 +1,24 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyc
+
+# Backups locales
+*.bak
+*.pre-*.bak
+
+# Datos generados (SII)
+data/
+data_sii/
+
+# Debug
+debug_prt_dump.jsonl
+last_dump.html
+resultado_real.html
+*.log
+
+# Entorno
+.env
+.env.*
+venv/
+.venv/
