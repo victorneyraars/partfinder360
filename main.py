@@ -286,6 +286,7 @@ def consultar_tasacion(marca: str = None, modelo: str = None, anio: int = None, 
 
 
 MTT_CONSULTA_URL = "https://apps.mtt.cl/consultaweb/default.aspx"
+MTT_SERVICE_URL = os.getenv("MTT_SERVICE_URL", "http://mtt-service:3091")
 
 
 def _mtt_field(name, html_text):
@@ -1262,10 +1263,40 @@ def _full_prt(plate: str) -> dict:
     return {"status": "error", "data": {}}
 
 
-def _full_mtt(plate: str) -> dict:
-    """Consulta MTT para el dashboard: {status, data}."""
+def _fetch_mtt_from_service(plate: str):
+    """Consulta el microservicio mtt-service (con cache) para MTT.
+    Devuelve el dict de datos o None si el servicio falla (fallback al
+    scraper local en ese caso).
+    """
     try:
-        result = _scrape_mtt(plate)
+        url = f"{MTT_SERVICE_URL.rstrip('/')}/api/v1/mtt/{plate}"
+        r = requests.get(url, timeout=15)
+        if r.status_code != 200:
+            print(f"/full: mtt-service HTTP {r.status_code}")
+            return None
+        payload = r.json()
+        if not isinstance(payload, dict) or not payload.get("success"):
+            return None
+        return payload.get("data") or None
+    except Exception as e:
+        print(f"/full: mtt-service error {plate}: {str(e)[:120]}")
+        return None
+
+
+def _full_mtt(plate: str) -> dict:
+    """Consulta MTT para el dashboard: {status, data}.
+    Orden: microservicio mtt-service (con cache) primero, scraper local
+    como fallback si el servicio no responde.
+    """
+    result = _fetch_mtt_from_service(plate)
+    if result is None:
+        # Fallback al scraper local
+        try:
+            result = _scrape_mtt(plate)
+        except Exception as e:
+            print(f"/full: mtt scraper {plate}: {e}")
+            return {"status": "error", "data": {}}
+    try:
         data = _mtt_deep_sanitize({
             "patente": plate,
             "fuente": "MTT",
@@ -1629,10 +1660,14 @@ def consultar_patente(patente: str, provider: str = "prt", marca: str = "", mode
         )
 
     if provider.lower() == "mtt":
-        try:
-            mtt_result = _scrape_mtt(patente_clean)
-        except Exception as e:
-            raise HTTPException(status_code=502, detail=f"Fallo consultando MTT: {str(e)}")
+        # 1. Intentar microservicio con cache
+        mtt_result = _fetch_mtt_from_service(patente_clean)
+        # 2. Fallback al scraper local si el servicio no responde
+        if mtt_result is None:
+            try:
+                mtt_result = _scrape_mtt(patente_clean)
+            except Exception as e:
+                raise HTTPException(status_code=502, detail=f"Fallo consultando MTT: {str(e)}")
 
         mtt_data = _mtt_deep_sanitize({
             "patente": patente_clean,
