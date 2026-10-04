@@ -22,3 +22,6 @@ resultado_real.html
 .env.*
 venv/
 .venv/
+
+# Excepcion: plantilla de env SI va al repo
+!deploy/.env.example

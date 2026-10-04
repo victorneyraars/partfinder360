@@ -1,0 +1,72 @@
+name: partfinder360
+
+services:
+  database:
+    image: postgres:15-alpine
+    container_name: pf_database
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: partfinder
+      POSTGRES_USER: pf_user
+      POSTGRES_PASSWORD: secure_db_password_change_me
+    volumes:
+      - /opt/partfinder360/database:/var/lib/postgresql/data
+    networks:
+      - pf_network
+
+  partfinder-api:
+    image: python:3.11-slim
+    container_name: pf_api
+    restart: unless-stopped
+    working_dir: /app
+    volumes:
+      - /opt/partfinder360/partfinder:/app
+      - /opt/partfinder360:/debug_host:rw
+    env_file:
+      - /opt/partfinder360/.env
+    environment:
+      - PRT_SERVICE_URL=http://host.docker.internal:3090
+      - MTT_SERVICE_URL=http://mtt-service:3091
+      - BOOSTR_SERVICE_URL=http://boostr-service:3092
+      - DEBUG_DUMP_PATH=/debug_host/debug_prt_dump.jsonl
+    extra_hosts:
+      - "host.docker.internal:172.18.0.1"
+    command: bash -c "pip install --no-cache-dir -r requirements.txt && uvicorn main:app --host 0.0.0.0 --port 8000 --reload"
+    ports:
+      - "8000:8000"
+    networks:
+      - pf_network
+    depends_on:
+      - database
+      - mtt-service
+      - boostr-service
+
+  mtt-service:
+    image: mtt-service:1.0.0
+    container_name: pf_mtt_service
+    restart: unless-stopped
+    environment:
+      - MTT_CACHE_DB=/data/mtt_cache.db
+      - MTT_CACHE_TTL_DAYS=15
+    volumes:
+      - /opt/servicios/mtt-service/data:/data
+    networks:
+      - pf_network
+
+  boostr-service:
+    image: boostr-service:1.0.0
+    container_name: pf_boostr_service
+    restart: unless-stopped
+    env_file:
+      - /opt/partfinder360/.env
+    environment:
+      - BOOSTR_CACHE_DB=/data/boostr_cache.db
+      - BOOSTR_CACHE_TTL_DAYS=15
+    volumes:
+      - /opt/servicios/boostr-service/data:/data
+    networks:
+      - pf_network
+
+networks:
+  pf_network:
+    driver: bridge
