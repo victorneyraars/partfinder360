@@ -1444,7 +1444,12 @@ def log_usage_event(
         if not device_id:
             return
         platform = "unknown"
-        if request is not None:
+        # 1. Si el device_id es un UUID (no fingerprint), es la app movil
+        #    (Flutter envia UUID via UsageTracker). Dart no incluye "android"
+        #    en el User-Agent, por eso no se detecta de ahi.
+        if device_id and not device_id.startswith("fp-"):
+            platform = "android"
+        elif request is not None:
             ua = request.headers.get("user-agent", "").lower()
             if "android" in ua:
                 platform = "android"
