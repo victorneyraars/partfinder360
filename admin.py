@@ -290,3 +290,180 @@ def admin_plates_recent(limit: int = 50, user: str = Depends(verify_admin_token)
         }
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error consultando patentes: {str(e)[:120]}")
+
+# ============================================================
+# GET /api/admin/usage/overview
+# ============================================================
+@router.get("/usage/overview")
+def admin_usage_overview(user: str = Depends(verify_admin_token)):
+    try:
+        conn = get_db_connection()
+        cur = conn.cursor()
+
+        # Total eventos y devices unicos
+        cur.execute("SELECT COUNT(*) AS n FROM usage_events")
+        total_events = cur.fetchone()["n"]
+
+        cur.execute("SELECT COUNT(DISTINCT device_id) AS n FROM usage_events")
+        total_devices = cur.fetchone()["n"]
+
+        # DAU: devices unicos hoy
+        cur.execute('''
+            SELECT COUNT(DISTINCT device_id) AS n
+            FROM usage_events
+            WHERE created_at >= CURRENT_DATE
+        ''')
+        dau = cur.fetchone()["n"]
+
+        # MAU: devices unicos ultimos 30 dias
+        cur.execute('''
+            SELECT COUNT(DISTINCT device_id) AS n
+            FROM usage_events
+            WHERE created_at >= NOW() - INTERVAL '30 days'
+        ''')
+        mau = cur.fetchone()["n"]
+
+        # WAU: ultimos 7 dias
+        cur.execute('''
+            SELECT COUNT(DISTINCT device_id) AS n
+            FROM usage_events
+            WHERE created_at >= NOW() - INTERVAL '7 days'
+        ''')
+        wau = cur.fetchone()["n"]
+
+        # Eventos por tipo (top 10)
+        cur.execute('''
+            SELECT event_type, COUNT(*) AS n
+            FROM usage_events
+            GROUP BY event_type
+            ORDER BY n DESC
+            LIMIT 10
+        ''')
+        by_type = [dict(r) for r in cur.fetchall()]
+
+        cur.close()
+        conn.close()
+        return {
+            "status": "ok",
+            "total_events": total_events,
+            "total_devices": total_devices,
+            "dau": dau,
+            "wau": wau,
+            "mau": mau,
+            "events_by_type": by_type,
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error usage overview: {str(e)[:120]}")
+
+
+# ============================================================
+# GET /api/admin/usage/activity?days=30
+# ============================================================
+@router.get("/usage/activity")
+def admin_usage_activity(days: int = 30, user: str = Depends(verify_admin_token)):
+    if days < 1 or days > 365:
+        raise HTTPException(status_code=400, detail="days debe estar entre 1 y 365")
+    try:
+        conn = get_db_connection()
+        cur = conn.cursor()
+        cur.execute('''
+            SELECT
+              DATE(created_at) AS dia,
+              COUNT(*) AS eventos,
+              COUNT(DISTINCT device_id) AS devices
+            FROM usage_events
+            WHERE created_at >= NOW() - (%s || ' days')::interval
+            GROUP BY DATE(created_at)
+            ORDER BY dia DESC
+        ''', (days,))
+        rows = [dict(r) for r in cur.fetchall()]
+        cur.close()
+        conn.close()
+        return {
+            "status": "ok",
+            "days": days,
+            "activity": rows,
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error usage activity: {str(e)[:120]}")
+
+
+# ============================================================
+# GET /api/admin/usage/events?limit=50
+# ============================================================
+@router.get("/usage/events")
+def admin_usage_events(limit: int = 50, user: str = Depends(verify_admin_token)):
+    if limit < 1 or limit > 500:
+        raise HTTPException(status_code=400, detail="limit debe estar entre 1 y 500")
+    try:
+        conn = get_db_connection()
+        cur = conn.cursor()
+        cur.execute('''
+            SELECT id, device_id, event_type, plate, platform, app_version, metadata, created_at
+            FROM usage_events
+            ORDER BY created_at DESC
+            LIMIT %s
+        ''', (limit,))
+        rows = []
+        for r in cur.fetchall():
+            rows.append({
+                "id": r["id"],
+                "device_id": r["device_id"],
+                "event_type": r["event_type"],
+                "plate": r["plate"],
+                "platform": r["platform"],
+                "app_version": r["app_version"],
+                "metadata": r["metadata"],
+                "created_at": str(r["created_at"]),
+            })
+        cur.close()
+        conn.close()
+        return {
+            "status": "ok",
+            "count": len(rows),
+            "events": rows,
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error usage events: {str(e)[:120]}")
+
+
+# ============================================================
+# GET /api/admin/usage/top_devices?limit=10
+# ============================================================
+@router.get("/usage/top_devices")
+def admin_usage_top_devices(limit: int = 10, user: str = Depends(verify_admin_token)):
+    if limit < 1 or limit > 100:
+        raise HTTPException(status_code=400, detail="limit debe estar entre 1 y 100")
+    try:
+        conn = get_db_connection()
+        cur = conn.cursor()
+        cur.execute('''
+            SELECT
+              device_id,
+              COUNT(*) AS eventos,
+              COUNT(DISTINCT DATE(created_at)) AS dias_activo,
+              MIN(created_at) AS primera_vez,
+              MAX(created_at) AS ultima_vez
+            FROM usage_events
+            GROUP BY device_id
+            ORDER BY eventos DESC
+            LIMIT %s
+        ''', (limit,))
+        rows = []
+        for r in cur.fetchall():
+            rows.append({
+                "device_id": r["device_id"],
+                "eventos": r["eventos"],
+                "dias_activo": r["dias_activo"],
+                "primera_vez": str(r["primera_vez"]),
+                "ultima_vez": str(r["ultima_vez"]),
+            })
+        cur.close()
+        conn.close()
+        return {
+            "status": "ok",
+            "top_devices": rows,
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error usage top_devices: {str(e)[:120]}")
+
