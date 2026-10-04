@@ -873,6 +873,7 @@ def _resolver_tasacion_sii(patente, marca_q="", modelo_q="", anio_q="", cilindra
                 headers={"X-API-KEY": BOOSTR_API_KEY},
                 timeout=15,
             )
+            _update_boostr_quota_from_response(r)
             if r.status_code == 200:
                 raw = r.json()
                 d = (raw.get("data") or raw) if isinstance(raw, dict) else {}
@@ -1103,6 +1104,45 @@ def _boostr_enrich(v_inner: dict) -> dict:
     return out
 
 
+
+
+# ============================================================
+# Boostr: actualizar cuota en BD desde headers de respuesta
+# ============================================================
+def _update_boostr_quota_from_response(response):
+    """Boostr expone ratelimit-remaining, ratelimit-limit, ratelimit-reset
+    en cada respuesta. Actualizamos la tabla api_quota con esos valores
+    reales. Silencioso: nunca rompe el flujo si falla."""
+    try:
+        remaining = response.headers.get("ratelimit-remaining")
+        limit = response.headers.get("ratelimit-limit")
+        if remaining is None or limit is None:
+            return
+        try:
+            remaining_i = int(remaining)
+            limit_i = int(limit)
+        except (ValueError, TypeError):
+            return
+        conn = get_db_connection()
+        cur = conn.cursor()
+        cur.execute("""
+            INSERT INTO api_quota (provider, total_limit, remaining, updated_at)
+            VALUES ('boostr', %s, %s, NOW())
+            ON CONFLICT (provider) DO UPDATE
+            SET total_limit = EXCLUDED.total_limit,
+                remaining = EXCLUDED.remaining,
+                updated_at = EXCLUDED.updated_at
+        """, (limit_i, remaining_i))
+        conn.commit()
+        cur.close()
+        conn.close()
+    except Exception as e:
+        try:
+            print(f"[BOOSTR-QUOTA] error actualizando cuota: {e}")
+        except Exception:
+            pass
+
+
 def _full_boostr(plate: str) -> dict:
     """Consulta Boostr para el dashboard: {status, data}. 429/PLAN_LIMIT →
     status 'queued' + encolado automático."""
@@ -1114,6 +1154,7 @@ def _full_boostr(plate: str) -> dict:
             headers={"X-API-KEY": BOOSTR_API_KEY},
             timeout=15,
         )
+        _update_boostr_quota_from_response(r)
         if r.status_code == 429 or "PLAN_LIMIT_EXCEEDED" in (r.text or "").upper():
             try:
                 import boostr_queue_worker
@@ -1286,6 +1327,7 @@ def _full_fuel_efficiency(plate: str) -> dict:
             headers={"X-API-KEY": BOOSTR_API_KEY},
             timeout=15,
         )
+        _update_boostr_quota_from_response(r)
         if r.status_code != 200:
             # HTTP no-200 del portal de consumo → caída real (5xx/timeout) o
             # ausencia documentada; sin body utilizable se mapea a not_found
@@ -1637,6 +1679,7 @@ def consultar_patente(patente: str, provider: str = "prt", marca: str = "", mode
 
     try:
         response = requests.get(url, headers=headers, timeout=15)
+        _update_boostr_quota_from_response(response)
         if response.status_code == 429 or "PLAN_LIMIT_EXCEEDED" in (response.text or "").upper():
             # Cuota agotada: encolar para sincronización automática y avisar.
             try:
@@ -1764,6 +1807,7 @@ def generar_pdf_patente(patente: str):
             url = f"https://api.boostr.cl/vehicle/{patente_clean}.json"
             headers = {"X-API-KEY": BOOSTR_API_KEY}
             resp = requests.get(url, headers=headers, timeout=10)
+            _update_boostr_quota_from_response(resp)
             if resp.status_code == 200:
                 bd = resp.json().get("data", {})
                 if isinstance(bd, dict):
@@ -1897,7 +1941,7 @@ def get_boostr_status():
         "status": "ONLINE" if BOOSTR_API_KEY else "OFFLINE",
         "plan": "PRO",
         "daily_limit": 100,
-        "remaining": 69,
+        "remaining": -1,
         "client": "Sandra Alvarado",
         "cached_plates": 0
     }
@@ -2099,6 +2143,7 @@ def fallback_boostr(payload: dict):
     headers = {"X-API-KEY": BOOSTR_API_KEY}
     try:
         r = requests.get(url, headers=headers, timeout=15)
+        _update_boostr_quota_from_response(r)
         if r.status_code != 200:
             raise HTTPException(status_code=404, detail="Patente no encontrada en Boostr")
         b_res = r.json()
