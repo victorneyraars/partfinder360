@@ -135,6 +135,20 @@ def enrich_with_sii(vehicle_dict):
     return vehicle_dict
 app = FastAPI(title="PartFinder 360 API")
 
+
+# Middleware: forzar charset=utf-8 en respuestas JSON.
+# FastAPI/Starlette devuelve `application/json` sin charset, y varios clientes
+# (Dart http, curl viejo, apps iOS nativas) asumen Latin-1 -> mojibake en
+# acentos y ñ ("Vehiculo" -> "VehÃculo"). Este middleware lo previene en el
+# origen para cualquier cliente.
+@app.middleware("http")
+async def _force_utf8_charset(request: Request, call_next):
+    response = await call_next(request)
+    ctype = response.headers.get("content-type", "")
+    if ctype.startswith("application/json") and "charset" not in ctype.lower():
+        response.headers["content-type"] = "application/json; charset=utf-8"
+    return response
+
 # Admin API
 app.include_router(admin_router)
 app.include_router(usage_router)
