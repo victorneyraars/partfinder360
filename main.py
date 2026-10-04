@@ -1,17 +1,20 @@
 from pydantic import BaseModel
+from typing import Optional
 
 import os
 import json
 import re
 import requests
 import asyncio
+import hashlib
+import time as _time
 import unicodedata
 from datetime import datetime, date
 from html import unescape as html_unescape
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import Response
 import psycopg2
-from psycopg2.extras import RealDictCursor
+from psycopg2.extras import RealDictCursor, Json
 from fpdf import FPDF
 
 # Admin API (protegido con JWT)
@@ -1326,8 +1329,75 @@ def _full_auto_seguro(plate: str) -> dict:
     }
 
 
+
+
+# ============================================================
+# Usage tracking: helper para registrar eventos del backend
+# ============================================================
+def _generate_fingerprint(request: Request) -> str:
+    """Genera un device_id estable a partir de IP + User-Agent.
+    Fallback para cuando el APK no envia device_id explicito."""
+    try:
+        ip = request.client.host if request.client else "unknown"
+        ua = request.headers.get("user-agent", "")[:200]
+        raw = f"{ip}|{ua}"
+        return "fp-" + hashlib.sha256(raw.encode()).hexdigest()[:24]
+    except Exception:
+        return "fp-unknown"
+
+
+def log_usage_event(
+    device_id: Optional[str],
+    event_type: str,
+    plate: Optional[str] = None,
+    metadata: Optional[dict] = None,
+    request: Optional[Request] = None,
+):
+    """Registra un evento de uso en usage_events. Silencioso: nunca rompe
+    el flujo principal si falla."""
+    try:
+        # Si no hay device_id, generar fingerprint desde request
+        if not device_id and request is not None:
+            device_id = _generate_fingerprint(request)
+        if not device_id:
+            return
+        platform = "unknown"
+        if request is not None:
+            ua = request.headers.get("user-agent", "").lower()
+            if "android" in ua:
+                platform = "android"
+            elif "iphone" in ua or "ipad" in ua:
+                platform = "ios"
+            elif "curl" in ua or "python" in ua:
+                platform = "server"
+        conn = get_db_connection()
+        cur = conn.cursor()
+        cur.execute(
+            """
+            INSERT INTO usage_events
+              (device_id, event_type, plate, platform, metadata)
+            VALUES (%s, %s, %s, %s, %s)
+            """,
+            (
+                device_id[:64],
+                event_type[:32],
+                (plate or "")[:10] or None,
+                platform[:20],
+                Json(metadata) if metadata else None,
+            ),
+        )
+        conn.commit()
+        cur.close()
+        conn.close()
+    except Exception as e:
+        try:
+            print(f"[USAGE-LOG] error: {e}")
+        except Exception:
+            pass
+
+
 @app.get("/api/patente/{patente}/full")
-async def consulta_full(patente: str):
+async def consulta_full(patente: str, request: Request, device_id: Optional[str] = None):
     """Dashboard unificado: consulta SIMULTÁNEA (asyncio.gather) de las 5
     fuentes oficiales (PRT, Boostr, MTT, SII, 3CV) + Auto Seguro en idle."""
     patente_clean = patente.strip().upper().replace("-", "").replace(" ", "")
@@ -1337,6 +1407,7 @@ async def consulta_full(patente: str):
             detail="Formato de patente inválido. Verifique las normas oficiales de la PPU de Chile (Ej: ABCD12 o AB1234).",
         )
 
+    _t0 = _time.time()
     results = await asyncio.gather(
         asyncio.to_thread(_full_prt, patente_clean),
         asyncio.to_thread(_full_boostr, patente_clean),
@@ -1353,6 +1424,23 @@ async def consulta_full(patente: str):
             print(f"/full: excepción en fuente {idx}: {r}")
             return {"status": "error", "data": {}}
         return r or {"status": "error", "data": {}}
+
+    # Tracking: registrar consulta del dashboard (con o sin cache)
+    _dur_ms = int((_time.time() - _t0) * 1000)
+    _sources = {}
+    for _i, _key in enumerate(["prt", "boostr", "mtt", "sii", "fuel_efficiency", "auto_seguro"]):
+        _r = _safe(_i)
+        _sources[_key] = (_r.get("status") if isinstance(_r, dict) else "error") or "unknown"
+    log_usage_event(
+        device_id=device_id,
+        event_type="dashboard_query",
+        plate=patente_clean,
+        metadata={
+            "duration_ms": _dur_ms,
+            "sources": _sources,
+        },
+        request=request,
+    )
 
     return {
         "plate": patente_clean,
