@@ -662,7 +662,7 @@ def _scrape_mtt(plate):
     sess.headers.update({"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124 Safari/537.36",
                          "Accept": "text/html,application/xhtml+xml"})
 
-    r1 = sess.get(MTT_CONSULTA_URL, timeout=20)
+    r1 = sess.get(MTT_CONSULTA_URL, timeout=5)
     if r1.status_code != 200:
         raise RuntimeError(f"MTT GET fallo con {r1.status_code}")
     page = _mtt_decode_response(r1)
@@ -674,7 +674,7 @@ def _scrape_mtt(plate):
         "__VIEWSTATEGENERATOR": _mtt_field("__VIEWSTATEGENERATOR", page),
         "__EVENTVALIDATION": _mtt_field("__EVENTVALIDATION", page),
     }
-    r2 = sess.post(MTT_CONSULTA_URL, data=payload, timeout=25)
+    r2 = sess.post(MTT_CONSULTA_URL, data=payload, timeout=5)
     if r2.status_code != 200:
         raise RuntimeError(f"MTT POST fallo con {r2.status_code}")
     page = _mtt_decode_response(r2)
@@ -1190,9 +1190,33 @@ def _full_boostr(plate: str) -> dict:
 
 
 def _full_prt(plate: str) -> dict:
-    """Consulta PRT para el dashboard: {status, data} (microservicio y, si
-    falla o bloquea, la ficha base ya persistida en vehicle_cache)."""
+    """Consulta PRT para el dashboard: {status, data}.
+    ORDEN CORREGIDO:
+      1) vehicle_cache (datos REALES del WebView con captcha humano)
+      2) prt-service microservicio (fallback para cuando este en modo real)
+    El cache tiene prioridad para no depender del microservicio (que hoy
+    corre en modo mock y devuelve datos ficticios para 4 patentes fijas).
+    """
     from fastapi import HTTPException as _HTTPException
+
+    # 1) PRIMERO: buscar en vehicle_cache (datos reales del WebView P2P)
+    try:
+        conn = get_db_connection()
+        cur = conn.cursor()
+        cur.execute("SELECT data FROM vehicle_cache WHERE plate = %s;", (plate,))
+        row = cur.fetchone()
+        cur.close()
+        conn.close()
+        if row:
+            d = row["data"] if isinstance(row, dict) else row[0]
+            if isinstance(d, dict) and (d.get("marca") or d.get("rt_estado") or d.get("historial_rt")):
+                d["data_source"] = "PRT"
+                d["fuente"] = d.get("fuente") or "PRT Oficial"
+                return {"status": "ok", "data": d}
+    except Exception as e:
+        print(f"/full: prt cache {plate}: {e}")
+
+    # 2) SEGUNDO: consultar microservicio PRT (para cuando este en modo real)
     try:
         result = prt_client.consultar_revision_tecnica(plate)
         vehicle = result.get("vehicle") or {}
@@ -1234,22 +1258,7 @@ def _full_prt(plate: str) -> dict:
         pass
     except Exception as e:
         print(f"/full: prt {plate}: {e}")
-    # Fallback a la ficha base en caché (si fue resuelta por el móvil P2P).
-    try:
-        conn = get_db_connection()
-        cur = conn.cursor()
-        cur.execute("SELECT data FROM vehicle_cache WHERE plate = %s;", (plate,))
-        row = cur.fetchone()
-        cur.close()
-        conn.close()
-        if row:
-            d = row["data"] if isinstance(row, dict) else row[0]
-            if isinstance(d, dict) and (d.get("marca") or d.get("rt_estado") or d.get("historial_rt")):
-                d["data_source"] = "PRT"
-                d["fuente"] = d.get("fuente") or "PRT Oficial"
-                return {"status": "ok", "data": d}
-    except Exception as e:
-        print(f"/full: prt cache {plate}: {e}")
+
     return {"status": "error", "data": {}}
 
 
