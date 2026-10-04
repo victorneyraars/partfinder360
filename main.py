@@ -20,6 +20,7 @@ from fpdf import FPDF
 # Admin API (protegido con JWT)
 from admin import router as admin_router  # noqa: E402
 from usage import router as usage_router  # noqa: E402
+from admin_tests import router as admin_tests_router  # noqa: E402
 
 # Cliente HTTP dedicado para el microservicio PRT.
 import prt_client
@@ -137,6 +138,7 @@ app = FastAPI(title="PartFinder 360 API")
 # Admin API
 app.include_router(admin_router)
 app.include_router(usage_router)
+app.include_router(admin_tests_router)
 
 DB_HOST = os.getenv("DB_HOST", "pf_database")
 DB_NAME = os.getenv("DB_NAME", "partfinder")
