@@ -159,6 +159,7 @@ DB_NAME = os.getenv("DB_NAME", "partfinder")
 DB_USER = os.getenv("DB_USER", "pf_user")
 DB_PASSWORD = os.getenv("DB_PASSWORD", "secure_db_password_change_me")
 BOOSTR_API_KEY = os.getenv("BOOSTR_API_KEY", "")
+BOOSTR_SERVICE_URL = os.getenv("BOOSTR_SERVICE_URL", "http://boostr-service:3092")
 
 def get_db_connection():
     return psycopg2.connect(
@@ -882,27 +883,30 @@ def _resolver_tasacion_sii(patente, marca_q="", modelo_q="", anio_q="", cilindra
         except Exception as e:
             print(f"SII: error leyendo ficha base: {e}")
 
-    # 2) Respaldo: ficha desde Boostr API.
+    # 2) Respaldo: ficha desde boostr-service (con cache SQLite).
     if not (marca and modelo and anio) and BOOSTR_API_KEY:
         try:
             r = requests.get(
-                f"https://api.boostr.cl/vehicle/{patente}.json",
-                headers={"X-API-KEY": BOOSTR_API_KEY},
-                timeout=15,
+                f"{BOOSTR_SERVICE_URL}/api/v1/boostr/{patente}",
+                timeout=20,
             )
-            _update_boostr_quota_from_response(r)
             if r.status_code == 200:
-                raw = r.json()
-                d = (raw.get("data") or raw) if isinstance(raw, dict) else {}
-                if isinstance(d, dict):
-                    marca = marca or _sii_normalize(d.get("make"))
-                    modelo = modelo or _sii_normalize(d.get("model"))
-                    if not anio:
-                        anio = _extraer_anio(d.get("year"))
-                    if cilindrada_ficha is None:
-                        cilindrada_ficha = _sii_parse_cc(d.get("engine_size"))
+                payload = r.json()
+                # Propagar ratelimit a Postgres (solo viene en cache miss).
+                rl = payload.get("ratelimit")
+                if rl:
+                    _update_boostr_quota_from_response(rl)
+                if payload.get("status") == "ok":
+                    d = payload.get("data") or {}
+                    if isinstance(d, dict):
+                        marca = marca or _sii_normalize(d.get("make"))
+                        modelo = modelo or _sii_normalize(d.get("model"))
+                        if not anio:
+                            anio = _extraer_anio(d.get("year"))
+                        if cilindrada_ficha is None:
+                            cilindrada_ficha = _sii_parse_cc(d.get("engine_size"))
         except Exception as e:
-            print(f"SII: Boostr falló: {e}")
+            print(f"SII: boostr-service falló: {e}")
 
     if not (marca and modelo and anio):
         raise HTTPException(
@@ -1126,13 +1130,21 @@ def _boostr_enrich(v_inner: dict) -> dict:
 # ============================================================
 # Boostr: actualizar cuota en BD desde headers de respuesta
 # ============================================================
-def _update_boostr_quota_from_response(response):
+def _update_boostr_quota_from_response(response_or_headers):
     """Boostr expone ratelimit-remaining, ratelimit-limit, ratelimit-reset
     en cada respuesta. Actualizamos la tabla api_quota con esos valores
-    reales. Silencioso: nunca rompe el flujo si falla."""
+    reales. Silencioso: nunca rompe el flujo si falla.
+
+    Acepta tanto un objeto requests.Response (llamada directa) como un
+    dict de headers (cuando el boostr-service devuelve el ratelimit en el
+    JSON)."""
     try:
-        remaining = response.headers.get("ratelimit-remaining")
-        limit = response.headers.get("ratelimit-limit")
+        if hasattr(response_or_headers, "headers"):
+            headers = response_or_headers.headers
+        else:
+            headers = response_or_headers or {}
+        remaining = headers.get("ratelimit-remaining")
+        limit = headers.get("ratelimit-limit")
         if remaining is None or limit is None:
             return
         try:
@@ -1161,49 +1173,60 @@ def _update_boostr_quota_from_response(response):
 
 
 def _full_boostr(plate: str) -> dict:
-    """Consulta Boostr para el dashboard: {status, data}. 429/PLAN_LIMIT →
-    status 'queued' + encolado automático."""
+    """Consulta Boostr vía microservicio con cache: {status, data}.
+
+    El boostr-service (puerto 3092) maneja cache SQLite (TTL 15d) y expone
+    los headers de ratelimit en el JSON. Aquí solo:
+      - propagamos el ratelimit a api_quota (Postgres),
+      - encolamos cuando el micro responde 'queued' (429 / PLAN_LIMIT),
+      - mapeamos 'not_found' (V-02) para que Flutter active el Caso B.
+
+    El enrich del payload ya lo hace el micro (boostr_client.boostr_enrich),
+    así que 'data' viene listo con aliases y RT vacío explícito.
+    """
     if not BOOSTR_API_KEY:
         return {"status": "error", "data": {}}
     try:
         r = requests.get(
-            f"https://api.boostr.cl/vehicle/{plate}.json?include=owner",
-            headers={"X-API-KEY": BOOSTR_API_KEY},
-            timeout=15,
+            f"{BOOSTR_SERVICE_URL}/api/v1/boostr/{plate}",
+            timeout=20,
         )
-        _update_boostr_quota_from_response(r)
-        if r.status_code == 429 or "PLAN_LIMIT_EXCEEDED" in (r.text or "").upper():
-            try:
-                import boostr_queue_worker
-                boostr_queue_worker.enqueue_plate(plate, "QUEUED")
-            except Exception as e:
-                print(f"/full: error encolando boostr {plate}: {e}")
-            return {"status": "queued", "data": {}}
-        if r.status_code != 200:
-            return {"status": "error", "data": {}}
-        data = r.json()
-        # ===== MAPEO SEMÁNTICO DE INEXISTENCIA =====
-        # Boostr responde HTTP 200 para patentes sin registro, con un payload
-        # de nivel raíz tipo: {"status":"error","data":"","code":"V-02",
-        # "message":"No encontramos datos asociados a la patente ingresada"}.
-        # Eso es "no existe en padrón" (NO un error de servicio): se mapea a
-        # un estado 'not_found' distinguible por Flutter para activar el
-        # Caso B (estado global "sin registros en ninguna fuente") sin
-        # confundirlo con un fallo de red o servicio caído.
-        code = (data.get("code") or "").upper()
-        message = (data.get("message") or "")
-        if code == "V-02" or "No encontramos datos" in message:
-            return {"status": "not_found", "data": {}}
-        v_inner = data.get("data", {})
-        if not v_inner or not isinstance(v_inner, dict) or not v_inner.get("make"):
-            return {"status": "error", "data": {}}
-        enriched = _boostr_enrich(v_inner)
-        enriched.setdefault("patente", plate)
-        enriched["data_source"] = "BOOSTR_API"
-        return {"status": "ok", "data": enriched}
     except requests.exceptions.RequestException as e:
-        print(f"/full: boostr red {plate}: {e}")
+        print(f"/full: boostr-service red {plate}: {e}")
         return {"status": "error", "data": {}}
+
+    if r.status_code != 200:
+        print(f"/full: boostr-service HTTP {r.status_code} para {plate}")
+        return {"status": "error", "data": {}}
+
+    try:
+        payload = r.json()
+    except Exception as e:
+        print(f"/full: boostr-service JSON inválido para {plate}: {e}")
+        return {"status": "error", "data": {}}
+
+    # Propagar ratelimit a Postgres (solo viene en cache miss).
+    rl = payload.get("ratelimit")
+    if rl:
+        _update_boostr_quota_from_response(rl)
+
+    status = payload.get("status", "error")
+
+    if status == "queued":
+        try:
+            import boostr_queue_worker
+            boostr_queue_worker.enqueue_plate(plate, "QUEUED")
+        except Exception as e:
+            print(f"/full: error encolando boostr {plate}: {e}")
+        return {"status": "queued", "data": {}}
+
+    if status == "not_found":
+        return {"status": "not_found", "data": {}}
+
+    if status != "ok" or not payload.get("data"):
+        return {"status": "error", "data": {}}
+
+    return {"status": "ok", "data": payload["data"]}
 
 
 def _full_prt(plate: str) -> dict:
@@ -1738,71 +1761,73 @@ def consultar_patente(patente: str, provider: str = "prt", marca: str = "", mode
     if not BOOSTR_API_KEY:
         raise HTTPException(status_code=500, detail="API Key de Boostr no configurada en el servidor.")
 
-    # SIEMPRE con ?include=owner: trae titular (fullname + documentNumber).
-    url = f"https://api.boostr.cl/vehicle/{patente_clean}.json?include=owner"
-    headers = {"X-API-KEY": BOOSTR_API_KEY}
+    # Consulta vía microservicio con cache SQLite (TTL 15d).
+    # El micro ya devuelve el payload enriquecido (_boostr_enrich) + ratelimit.
+    try:
+        response = requests.get(
+            f"{BOOSTR_SERVICE_URL}/api/v1/boostr/{patente_clean}",
+            timeout=20,
+        )
+    except requests.exceptions.RequestException as e:
+        raise HTTPException(status_code=502, detail=f"Fallo consultando boostr-service: {str(e)}")
+
+    if response.status_code != 200:
+        raise HTTPException(status_code=502, detail=f"boostr-service HTTP {response.status_code}")
 
     try:
-        response = requests.get(url, headers=headers, timeout=15)
-        _update_boostr_quota_from_response(response)
-        if response.status_code == 429 or "PLAN_LIMIT_EXCEEDED" in (response.text or "").upper():
-            # Cuota agotada: encolar para sincronización automática y avisar.
-            try:
-                import boostr_queue_worker
-                boostr_queue_worker.enqueue_plate(patente_clean, "QUEUED")
-            except Exception as e:
-                print(f"Error encolando {patente_clean}: {e}")
-            raise HTTPException(
-                status_code=429,
-                detail="Cuota mensual de Boostr agotada. Patente agendada para sincronización automática.",
-            )
-        if response.status_code == 404:
-            raise HTTPException(status_code=404, detail="Patente no encontrada en el registro oficial.")
-        
-        if response.status_code == 200:
-            boostr_data = response.json()
-            
-            # Si Boostr devolvió código de error (Ej: V-04), NO guardar en caché
-            if boostr_data.get("status") == "error" or boostr_data.get("code") == "V-04":
-                raise HTTPException(status_code=404, detail="Vehículo no encontrado en los registros de Boostr.")
+        payload = response.json()
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"boostr-service JSON inválido: {str(e)}")
 
-            v_inner = boostr_data.get("data", {})
-            if not v_inner or not isinstance(v_inner, dict) or not v_inner.get("make"):
-                raise HTTPException(status_code=404, detail="Datos del vehículo incompletos o no encontrados.")
+    # Propagar ratelimit a Postgres (solo viene en cache miss).
+    rl = payload.get("ratelimit")
+    if rl:
+        _update_boostr_quota_from_response(rl)
 
-            # ===== Payload ÍNTEGRO + enriquecimiento compartido =====
-            v_inner = _boostr_enrich(v_inner)
-            v_inner["data_source"] = "BOOSTR_API"
+    status = payload.get("status", "error")
 
-            # Guardar vehículo válido en la base de datos (payload completo,
-            # campos vacíos incluidos).
-            try:
-                conn = get_db_connection()
-                cur = conn.cursor()
-                cur.execute("""
-                    INSERT INTO vehicle_cache (plate, data) VALUES (%s, %s)
-                    ON CONFLICT (plate) DO UPDATE SET data = EXCLUDED.data, created_at = CURRENT_TIMESTAMP;
-                """, (patente_clean, json.dumps(v_inner)))
-                conn.commit()
-                cur.close()
-                conn.close()
-            except Exception as e:
-                print(f"Error guardando en caché: {e}")
+    if status == "queued":
+        try:
+            import boostr_queue_worker
+            boostr_queue_worker.enqueue_plate(patente_clean, "QUEUED")
+        except Exception as e:
+            print(f"Error encolando {patente_clean}: {e}")
+        raise HTTPException(
+            status_code=429,
+            detail="Cuota mensual de Boostr agotada. Patente agendada para sincronización automática.",
+        )
 
-            return {
-                "source": "BOOSTR_API",
-                "data_source": "BOOSTR_API",
-                "data": v_inner,
-                "cache_hit": True,
-                "requiere_verificacion": False,
-                "fuente": "Boostr",
-            }
-        else:
-            raise HTTPException(status_code=response.status_code, detail="Error consultando el servicio oficial.")
-    except HTTPException:
-        raise
-    except requests.exceptions.RequestException as e:
-        raise HTTPException(status_code=502, detail=f"Fallo de conexión externa: {str(e)}")
+    if status == "not_found":
+        raise HTTPException(status_code=404, detail="Patente no encontrada en el registro oficial.")
+
+    if status != "ok" or not payload.get("data"):
+        raise HTTPException(status_code=404, detail="Datos del vehículo incompletos o no encontrados.")
+
+    v_inner = payload["data"]
+    v_inner["data_source"] = "BOOSTR_API"
+
+    # Guardar en vehicle_cache del backend (persistencia compartida con otras fuentes).
+    try:
+        conn = get_db_connection()
+        cur = conn.cursor()
+        cur.execute("""
+            INSERT INTO vehicle_cache (plate, data) VALUES (%s, %s)
+            ON CONFLICT (plate) DO UPDATE SET data = EXCLUDED.data, created_at = CURRENT_TIMESTAMP;
+        """, (patente_clean, json.dumps(v_inner)))
+        conn.commit()
+        cur.close()
+        conn.close()
+    except Exception as e:
+        print(f"Error guardando en caché: {e}")
+
+    return {
+        "source": "BOOSTR_API",
+        "data_source": "BOOSTR_API",
+        "data": v_inner,
+        "cache_hit": True,
+        "requiere_verificacion": False,
+        "fuente": "Boostr",
+    }
 
 @app.get("/api/prt/{patente}")
 def consultar_prt_directo(patente: str):
@@ -1869,15 +1894,20 @@ def generar_pdf_patente(patente: str):
 
     if not vehicle_data and BOOSTR_API_KEY:
         try:
-            url = f"https://api.boostr.cl/vehicle/{patente_clean}.json"
-            headers = {"X-API-KEY": BOOSTR_API_KEY}
-            resp = requests.get(url, headers=headers, timeout=10)
-            _update_boostr_quota_from_response(resp)
+            resp = requests.get(
+                f"{BOOSTR_SERVICE_URL}/api/v1/boostr/{patente_clean}",
+                timeout=20,
+            )
             if resp.status_code == 200:
-                bd = resp.json().get("data", {})
-                if isinstance(bd, dict):
-                    vehicle_data = dict(bd)
-                    vehicle_data["fuente"] = "Boostr"
+                payload = resp.json()
+                rl = payload.get("ratelimit")
+                if rl:
+                    _update_boostr_quota_from_response(rl)
+                if payload.get("status") == "ok":
+                    bd = payload.get("data") or {}
+                    if isinstance(bd, dict):
+                        vehicle_data = dict(bd)
+                        vehicle_data["fuente"] = "Boostr"
         except Exception:
             pass
 
@@ -2200,48 +2230,27 @@ def fallback_boostr(payload: dict):
     except Exception as e:
         print(f"Error en cache fallback: {e}")
 
-    # 2. Consumir Boostr API (siempre con ?include=owner)
+    # 2. Consumir boostr-service (con cache SQLite, TTL 15d).
     if not BOOSTR_API_KEY:
         raise HTTPException(status_code=500, detail="BOOSTR_API_KEY no configurada")
-    
-    url = f"https://api.boostr.cl/vehicle/{plate_clean}.json?include=owner"
-    headers = {"X-API-KEY": BOOSTR_API_KEY}
+
     try:
-        r = requests.get(url, headers=headers, timeout=15)
-        _update_boostr_quota_from_response(r)
+        r = requests.get(
+            f"{BOOSTR_SERVICE_URL}/api/v1/boostr/{plate_clean}",
+            timeout=20,
+        )
         if r.status_code != 200:
             raise HTTPException(status_code=404, detail="Patente no encontrada en Boostr")
-        b_res = r.json()
-        v_inner = b_res.get("data", {})
-        if not v_inner or not v_inner.get("make"):
+        payload_r = r.json()
+        rl = payload_r.get("ratelimit")
+        if rl:
+            _update_boostr_quota_from_response(rl)
+        status_r = payload_r.get("status")
+        if status_r != "ok" or not payload_r.get("data"):
             raise HTTPException(status_code=404, detail="Datos no encontrados en Boostr")
-        
-        final_data = v_inner.copy()
-        final_data["patente"] = final_data.get("plate", plate_clean)
-        final_data["marca"] = final_data.get("marca") or final_data.get("make")
-        final_data["modelo"] = final_data.get("modelo") or final_data.get("model")
-        final_data["anio"] = final_data.get("anio") or final_data.get("year")
-        chassis_val = final_data.get("chassis") or final_data.get("chasis") or final_data.get("vin")
-        if chassis_val:
-            final_data["chasis"] = chassis_val
-            final_data["vin"] = chassis_val
-        final_data.setdefault("tipo", final_data.get("body_type") or "")
-        final_data.setdefault("nro_motor", final_data.get("engine") or "")
-        # Titular a nivel raíz (owner íntegro se preserva).
-        owner = final_data.get("owner")
-        if isinstance(owner, dict):
-            final_data["owner_name"] = owner.get("fullname") or ""
-            final_data["owner_rut"] = owner.get("documentNumber") or ""
-        else:
-            final_data.setdefault("owner_name", "")
-            final_data.setdefault("owner_rut", "")
-        final_data["owner_consultado"] = True
-        # Homologación Boostr: RT NO disponible (campos vacíos explícitos).
-        final_data["fuente"] = "Boostr"
-        final_data["rt_estado"] = ""
-        final_data["rt_vencimiento"] = ""
-        final_data["historial_rt"] = []
-        final_data["rt_disponible"] = False
+
+        final_data = dict(payload_r["data"])
+        # Este endpoint mantiene su data_source específico de fallback.
         final_data["data_source"] = "BOOSTR_FALLBACK"
 
         enrich_with_sii(final_data)
@@ -2250,7 +2259,8 @@ def fallback_boostr(payload: dict):
         conn = get_db_connection()
         cur = conn.cursor()
         cur.execute("""
-            INSERT INTO vehicle_cache (plate, data, created_at) VALUES (%s, %s::jsonb, NOW())
+            INSERT INTO vehicle_cache (plate, data, created_at)
+            VALUES (%s, %s::jsonb, NOW())
             ON CONFLICT (plate) DO UPDATE SET data = EXCLUDED.data, created_at = NOW();
         """, (plate_clean, json.dumps(final_data)))
         conn.commit()
